@@ -60,7 +60,6 @@ while p.poll() is None and t != 1000: #Start loop
     #py.press("d")
     py.keyDown(move)
     py.keyUp(move)
-    print(p.stdout.readline())
     #time.sleep(1)
     t += 1
 p.kill()
