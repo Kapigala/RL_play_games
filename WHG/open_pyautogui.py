@@ -5,6 +5,8 @@ import numpy as np
 import random
 import sys
 import pyscreenshot
+from datetime import date
+import os
 
 game_path=r"C:\Users\Kacper\PycharmProjects\RL_play_games\WHG\game_source\the-worlds-hardest-game.exe"
 #for i in range(N): #instances work
@@ -29,7 +31,8 @@ py.click((x,y))
 time.sleep(2.7)
 
 pic = pyscreenshot.grab(bbox=(luc[0], luc[1], rdc[0], rdc[1]))
-pic.show()
+pic.save("thumb_1.png")
+#pic.show()
 
 #p.kill()
 #raise
@@ -37,30 +40,36 @@ pic.show()
 for i in range(8):
     if p.poll() is None:
         time.sleep(1.1)
-py.click(x=x-217, y=y+96)
-time.sleep(1)
 if p.poll() is None:
-    sys.quit()
-#py.click(x=x+82, y=y+143)
-py.moveTo((x+82,y+143))
-py.click()
-time.sleep(1.5)
+    py.click(x=x-217, y=y+96)
+    time.sleep(1)
+else:
+    sys.exit()
+
+if p.poll() is None:
+    py.moveTo((x+82,y+143))
+    py.click()
+    time.sleep(1.5)
+else:
+    sys.exit()
+
 
 t=0
 
-while p.poll() is None and t != 1000: #Start loop
+#session start live = 0
+live=1
+session = str(date.today()).replace("-","_")
+os.mkdir(fr"../WHG/Train_sessions/{session}")
+while p.poll() is None and t != 10: #Start loop
 
     pic = pyscreenshot.grab(bbox=(luc[0], luc[1], rdc[0], rdc[1]))
-    pic.show()
+    #pic.show()
 
-    #pic.save("WHG/Train_sessions/ss.png")
+    pic.save(fr"../WHG/Train_sessions/{session}/{live}_{t}.png")
 
     move = random.choice(["a","w","s","d"])
-
-    #py.press("d")
     py.keyDown(move)
     py.keyUp(move)
-    #time.sleep(1)
     t += 1
 p.kill()
 print("QUIT")
