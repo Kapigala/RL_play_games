@@ -74,7 +74,6 @@ print("TRAINING SESSION START")
 alive = pyscreenshot.grab(bbox=(rdc[0]-50, luc[1], rdc[0], luc[1]+21)) #if change was death
 #ifwin = pyscreenshot.grab(bbox=(rdc[0] - 298, luc[1], rdc[0]-250, luc[1] + 21))  # if change was death
 ifwin = ImageGrab.grab().load()[luc[0],luc[1]+50]
-print(ifwin)
 delta_reward=0
 try:
     coins_now=len(list(py.locateAllOnScreen('coin_color.png',confidence=0.8)))
@@ -86,7 +85,7 @@ while p.poll() is None: #Start loop
 
     #terminations
     if t==20:
-        delta_reward -= 30
+        delta_reward -= 50
         print(f"attempt {live} fails [run out of time] - score:{delta_reward}")
         # zapisz jako wynik sesji t
         #time.sleep(0.1)
@@ -97,6 +96,7 @@ while p.poll() is None: #Start loop
         except:
             coins_now = 0
         alive = pyscreenshot.grab(bbox=(rdc[0] - 50, luc[1], rdc[0], luc[1] + 21))
+        delta_reward = 0
         #time.sleep(0.1)
         live += 1
         t = 0
@@ -136,7 +136,7 @@ while p.poll() is None: #Start loop
     #state
     pic = ImageOps.grayscale(pyscreenshot.grab(bbox=(luc[0], luc[1], rdc[0], rdc[1])))
     #coins_now
-    #print("CURRENT STATE:",pic,coins_now,delta_reward,t)
+    print("CURRENT STATE:",pic,coins_now,delta_reward,t)
 
     #if train
     pic.save(fr"../WHG/Train_sessions/{session}/{live}_{t}.png")
