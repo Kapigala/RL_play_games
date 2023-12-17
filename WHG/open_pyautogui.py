@@ -8,14 +8,16 @@ import pyscreenshot
 from datetime import date
 import os
 from PIL import Image, ImageOps,ImageGrab,ImageChops
-import cv2
+import mss
+import keyboard
+from pyscreeze import locateAll,locate
 
 #game_path=r"C:\Users\Kacper\PycharmProjects\RL_play_games\WHG\game_source\the-worlds-hardest-game.exe"
 game_path=r"C:\Users\Kacper\PycharmProjects\RL_play_games\WHG\game_source\WHGTrainer.exe"
 
 p = subprocess.Popen(game_path,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,)
 #time.sleep(1.5) #old pc setup
-time.sleep(1.2)
+time.sleep(1.3)
 
 s_location = py.locateOnScreen('game_finder.png')
 x,y = py.center(s_location)
@@ -87,15 +89,20 @@ try:
 except:
     coins_now = 0
 
-while p.poll() is None: #Start loop
-    move_time=time.time()
-    pic = ImageOps.grayscale(pyscreenshot.grab(bbox=(luc[0], luc[1]+25, rdc[0], rdc[1]-25)))
+monitor = {"top": luc[1]+25, "left": luc[0], "width": int(rdc[0]-luc[0]), "height": int(rdc[1]-25-luc[1]-25)}
 
+ys = ImageOps.grayscale(Image.open('yellow_square2.png'))
+coin = ImageOps.grayscale(Image.open('coin_color.png'))
+
+
+while p.poll() is None: #Start loop
+    move_time = time.time()
+
+    sc = mss.mss().grab(monitor)
+    pic = ImageOps.grayscale(Image.frombytes("RGB", sc.size, sc.bgra, "raw", "BGRX"))
+    time.sleep(0.001)
     #coins_now
     print("CURRENT STATE:",coins_now,delta_reward,t)
-
-    #if train
-    pic.save(fr"../WHG/Train_sessions/{session}/lvl_{lvl}/{live}_{t}.png")
 
     move = random.choice([
                             ["left"],["up"],["right"],["down"],
@@ -103,22 +110,16 @@ while p.poll() is None: #Start loop
                             ])
     print("Action",move)
 
-    py.FAILSAFE = False
     for m in move:
-        py.keyDown(m)
+        keyboard.press(m)
+    time.sleep(0.1)
     for m in move:
-        py.keyUp(m)
-    py.FAILSAFE = True
-
-    t += 1
+        keyboard.release(m)
 
     if pic.getpixel((1,30)) == 220:
         delta_reward +=  1000
         print(f"attempt {live} wins - score:{delta_reward}")
-        # zapisz jako wynik sesji t
-        #ifwin = full_sc.crop((245,0,305,21))
-        #time.sleep(0.1) #could be longer
-
+        ys = ImageOps.grayscale(Image.open('yellow_square_new.png')) #NOT SURE WHY THIS CHANGE IN TRAINING GAME
         #DURING PRETREIN
         #p.kill()
         lvl += 1
@@ -127,44 +128,52 @@ while p.poll() is None: #Start loop
         except:
             pass
 
+        time.sleep(5)
         try:
-            coins_now=len(list(py.locateAllOnScreen('coin_color.png',confidence=0.8)))
+            coins_now=len(list(py.locateAllOnScreen('coin_color.png',confidence=0.8,region=(luc[0], luc[1], rdc[0], rdc[1]))))
         except:
             coins_now = 0
 
-        break
-        time.sleep(1) #wait to go next
-        coins_now = len(list(py.locateAllOnScreen('coin_color.png', confidence=0.8, region=(luc[0], luc[1], rdc[0], rdc[1]))))
-
-        """
         #next lvl init TODO:
-        -current coint
-        -new full_sc
-        """
+        #-current coint
+        #-new full_sc
 
-    try:
-        list(py.locateOnScreen('yellow_square.png', confidence=0.9, region=(luc[0], luc[1], rdc[0], rdc[1])))[0]
+    print(locate(ys, pic))
+    if locate(ys, pic,grayscale=True) != None:
         delta_reward -= 1
         if coins_now != 0:
             bon = coins_now
-            coins_now = len(list(py.locateAllOnScreen('coin_color.png', confidence=0.8,region=(luc[0], luc[1], rdc[0], rdc[1]))))
+            #coins_now = len(list(py.locateAllOnScreen('coin_color.png', confidence=0.8,region=(luc[0], luc[1], rdc[0], rdc[1]))))
+            coins_now = len(list(locateAll(coin,pic)))
             delta_reward += 10*(bon-coins_now)
-    except:
+    else:
+        if pic.getpixel((1,30)) == 220:
+            continue
+        print("DEATH ON FRAME",t-1) #
+        #pic.show()
         delta_reward -= 100
         print(f"attempt {live} fails - score:{delta_reward}")
         # zapisz jako wynik sesji t
-        time.sleep(0.1)
-        try:
-            coins_now = len(
-                list(py.locateAllOnScreen('coin_color.png', confidence=0.8
-                                          , region=(luc[0], luc[1], rdc[0], rdc[1]))))
-        except:
-            coins_now = 0
+        #UZWGLĘDNIJ ZE T-1 FAILOWAŁO //zmodyfikować
+        time.sleep(0.2)
+        #try:
+         #   coins_now = len(
+          #      list(py.locateAllOnScreen('coin_color.png', confidence=0.8
+                                     #     , region=(luc[0], luc[1], rdc[0], rdc[1]))))
+           # print("COIN BACK",coins_now)
+        #except:
+         #   coins_now = 0
+        coins_now = len(list(py.locateAllOnScreen('coin_color.png', confidence=0.8
+                                              , region=(luc[0], luc[1], rdc[0], rdc[1]))))
+        print("COIN NOW:",coins_now)
         live += 1
         t=0
 
+    pic.save(fr"../WHG/Train_sessions/{session}/lvl_{lvl}/{live}_{t}.png")
+    t += 1
+
     #terminations
-    if t==20:
+    if t==200:
         delta_reward -= 50
         print(f"attempt {live} fails [run out of time] - score:{delta_reward}")
         # zapisz jako wynik sesji t
@@ -178,6 +187,7 @@ while p.poll() is None: #Start loop
         delta_reward = 0
         live += 1
         t = 0
+
     print("loop_time:",time.time()- move_time)
 p.kill()
 print("QUIT")
