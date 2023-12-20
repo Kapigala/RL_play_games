@@ -4,7 +4,6 @@ from time import time,sleep
 import numpy as np
 import random
 import sys
-import pyscreenshot
 from datetime import date
 import os
 from PIL import Image, ImageOps,ImageGrab,ImageChops
