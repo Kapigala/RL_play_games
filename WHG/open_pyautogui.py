@@ -24,8 +24,6 @@ x,y = py.center(s_location)
 
 luc, rdc = (x-274,y-166),(x+272,y+230)
 
-#py.click(luc)
-
 py.click((x,y))
 
 production=False
@@ -68,6 +66,8 @@ t=0
 #session start live = 0
 live=1
 session = str(date.today()).replace("-","_")
+lvl=1
+
 try:
     os.mkdir(fr"../WHG/Train_sessions/{session}")
 except:
@@ -75,10 +75,11 @@ except:
 
 try:
     os.mkdir(fr"../WHG/Train_sessions/{session}/lvl_1")
+    os.mkdir(fr"../WHG/Train_sessions/{session}/raport_1")
 except:
     pass
 
-lvl=1
+
 # INIT controlers
 print("TRAINING SESSION START")
 
@@ -93,6 +94,11 @@ monitor = {"top": luc[1]+25, "left": luc[0], "width": int(rdc[0]-luc[0]), "heigh
 ys = ImageOps.grayscale(Image.open('yellow_square2.png'))
 coin = ImageOps.grayscale(Image.open('coin_color.png'))
 
+if not os.path.isfile(fr"../WHG/Train_sessions/{session}/raport_{lvl}/reward_track.txt"):
+    f = open(fr"../WHG/Train_sessions/{session}/raport_{lvl}/reward_track.txt", "w")
+    f.write("live,time_step,action,reward\n")
+else:
+    f = open(fr"../WHG/Train_sessions/{session}/raport_{lvl}/reward_track.txt", "a")
 
 while p.poll() is None: #Start loop
     move_time = time()
@@ -100,8 +106,13 @@ while p.poll() is None: #Start loop
     sc = mss.mss().grab(monitor)
     pic = ImageOps.grayscale(Image.frombytes("RGB", sc.size, sc.bgra, "raw", "BGRX"))
 
+    #print(np.array(pic).shape)
+    #raise
+
     #coins_now
     print("CURRENT STATE:",coins_now,delta_reward,t)
+
+    pic.save(fr"../WHG/Train_sessions/{session}/lvl_{lvl}/{live}_{t}.png") # pic before action
 
     move = random.choice([
                             ["left"],["up"],["right"],["down"],
@@ -124,6 +135,7 @@ while p.poll() is None: #Start loop
         lvl += 1
         try:
             os.mkdir(fr"../WHG/Train_sessions/{session}/lvl_{lvl}")
+            os.mkdir(fr"../WHG/Train_sessions/{session}/raport_{lvl}")
         except:
             pass
 
@@ -132,10 +144,6 @@ while p.poll() is None: #Start loop
             coins_now=len(list(py.locateAllOnScreen('coin_color.png',confidence=0.8,region=(luc[0], luc[1], rdc[0], rdc[1]))))
         except:
             coins_now = 0
-
-        #next lvl init TODO:
-        #-current coint
-        #-new full_sc
 
     if locate(ys, pic,grayscale=True) != None:
         delta_reward -= 1
@@ -158,7 +166,6 @@ while p.poll() is None: #Start loop
         live += 1
         t=0
 
-    pic.save(fr"../WHG/Train_sessions/{session}/lvl_{lvl}/{live}_{t}.png")
     t += 1
 
     #terminations
@@ -172,9 +179,15 @@ while p.poll() is None: #Start loop
             coins_now = len(list(py.locateAllOnScreen('coin_color.png', confidence=0.8, region=(luc[0], luc[1], rdc[0], rdc[1]))))
         except:
             coins_now = 0
+
+        f.write(f"{live},{t-1},{move},{delta_reward}\n")
         delta_reward = 0
         live += 1
         t = 0
+
+    else:
+        f.write(f"{live},{t-1},{move},{delta_reward}\n")
+
 
     print("loop_time:",time()- move_time)
 p.kill()
