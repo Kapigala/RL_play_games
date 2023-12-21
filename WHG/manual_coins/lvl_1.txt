@@ -1,0 +1,2 @@
+Box(left=123, top=229, width=15, height=14)
+Box(left=375, top=106, width=15, height=14)

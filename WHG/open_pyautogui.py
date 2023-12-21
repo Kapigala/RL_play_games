@@ -119,6 +119,20 @@ while p.poll() is None: #Start loop
                             ])
     print("Action",move)
 
+    #żółty == pixel 14
+
+    #print(np.array(pic).shape)
+    #for y in range(346): # V
+     #   for x in range(546):
+      #      if pic.getpixel((x,y))!=189:
+       #         print(x,y,pic.getpixel((x,y)))
+    #raise
+    #if pic.getpixel((50,50))==94:
+     #  pic.show()
+      #  raise
+    print(locate(ys,pic))
+    #raise
+
     #move=[]
     for m in move:
         keyboard.press(m)
