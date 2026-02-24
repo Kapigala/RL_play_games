@@ -1,0 +1,509 @@
+import pymem
+import pymem.pattern
+import re
+import struct
+import time
+import numpy as np
+import subprocess
+import os
+import win32gui
+import win32con
+import win32api
+
+class GameHooker:
+    def __init__(self, process_name):
+        self.pm = pymem.Pymem(process_name)
+        self.hooks = {"key_state_array":{"mailbox":None,"offset":0x08}}
+        self.game_base = pymem.process.module_from_name(self.pm.process_handle, process_name).lpBaseOfDll
+        self.module = pymem.process.module_from_name(self.pm.process_handle, process_name)
+        self.key_map = {'SPACEBAR':0x20
+                       ,'ENTER':0x0D
+                       ,"LEFT":0x25
+                       ,"RIGHT":0x27
+                      ,"ESCAPE":0x1B
+                      }
+
+    def add_hook(self, name, pattern, reg_to_steal, offset):
+        """
+        name: nazwa zmiennej
+        pattern: bajty instrukcji (AOB)
+        reg_to_steal: rejestr (np. 'esi', 'edi', 'ecx', 'ebx')
+        offset: offset zmiennej w obiekcie
+        """
+        
+        # 1. Jeśli dostaliśmy string "D9 1B...", zamień na bajty
+        if isinstance(pattern, str):
+            # Usuwamy spacje i zamieniamy hex na bytes
+            pattern = bytes.fromhex(pattern.replace(" ", ""))
+        
+        # 2. KLUCZOWY MOMENT: 
+         #re.escape() na obiektach typu bytes doda \ przed znakami specjalnymi.
+        # To sprawi, że nawias (0x28) stanie się dla Pythona dwoma bajtami: 0x5C 0x28.
+        # Silnik re.search wewnątrz Pymem zobaczy \ (escape) i potraktuje nawias jako dane, nie kod.
+        safe_pattern = re.escape(pattern)
+        
+        # 3. Wywołujemy Pymem z "uzbrojonymi" bajtami
+        addr = pymem.pattern.pattern_scan_all(self.pm.process_handle, safe_pattern)
+        
+        if not addr:
+            print(f"[X] Nie znaleziono sygnatury dla: {name}, !{safe_pattern} !!{pattern}")
+            return
+
+        # Słownik rejestrów dla instrukcji MOV [abs], REG
+        reg_codes = {'eax': 0x05, 'ecx': 0x0D, 'edx': 0x15, 'ebx': 0x1D, 'esi': 0x35, 'edi': 0x3D}
+        
+        # 1. Alokacja mailboxa i cave'a
+        mailbox = self.pm.allocate(4)
+        cave = self.pm.allocate(128)
+        
+        # 2. Budowa kodu iniekcji
+         #MOV [mailbox], REG
+        injection = b"\x89" + struct.pack("B", reg_codes[reg_to_steal.lower()]) + struct.pack("<I", mailbox)
+        
+        # Obliczamy ile bajtów ma nasza sygnatura (w tym przypadku 6)
+        code_size = len(pattern) 
+        
+        # Pobieramy dokładnie tyle bajtów z gry, ile ma nasza sygnatura
+        original_bytes = self.pm.read_bytes(addr, code_size)
+        injection += original_bytes
+        
+        # JMP powrotny (skaczemy o tyle bajtów dalej, ile zabraliśmy)
+        return_addr = addr + code_size
+        rel_jmp_back = (return_addr - (cave + len(injection) + 5))
+        injection += b"\xE9" + struct.pack("<i", rel_jmp_back)
+        
+        # Zapisanie cave'a
+        self.pm.write_bytes(cave, injection, len(injection))
+        
+        # Wstawienie skoku w kod gry + NOPy dla reszty wolnego miejsca
+        rel_jmp_to_cave = (cave - (addr + 5))
+        patch = b"\xE9" + struct.pack("<i", rel_jmp_to_cave)
+        
+        # Jeśli instrukcja była dłuższa niż 5 bajtów, resztę wypełniamy NOPami (0x90)
+        patch += b"\x90" * (code_size - 5)
+        self.pm.write_bytes(addr, patch, len(patch))
+        
+        self.hooks[name] = {"mailbox": mailbox, "offset": offset}
+        print(f" New Hook: [~{hex(addr)}] {name}")
+
+    def add_static_address(self, name, pattern, reg_to_steal=None, offset=0x00, point=5):  
+    
+        # 1. Przygotowanie patternu (obsługa wildcardów i znaków specjalnych)
+        # Jeśli pattern jest stringiem typu "89 3D ?? ?? ?? ??", zamieniamy na regex
+        if isinstance(pattern, str):
+            # Zamieniamy spacje na brak spacji dla spójności
+            p = pattern.replace(" ", "")
+            # Jeśli są wildcardy '??', zamieniamy je na kropkę '.' (dowolny bajt w regex)
+            if "??" in p:
+                # Dzielimy na bajty i składamy regex
+                parts = [p[i:i+2] for i in range(0, len(p), 2)]
+                regex_parts = []
+                for part in parts:
+                    if part == "??":
+                        regex_parts.append(b'.')
+                    else:
+                        # Zamieniamy konkretny hex na bezpieczny zescapowany bajt
+                        regex_parts.append(re.escape(bytes.fromhex(part)))
+                final_pattern = re.compile(b"".join(regex_parts), re.DOTALL)
+            else:
+                # Brak wildcardów -> standardowy bezpieczny regex
+                final_pattern = re.compile(re.escape(bytes.fromhex(p)), re.DOTALL)
+        elif isinstance(pattern, bytes):
+            # Jeśli to surowe bajty, zabezpieczamy znaki specjalne (jak 0x28)
+            final_pattern = re.compile(re.escape(pattern), re.DOTALL)
+        else:
+            # Jeśli to już skompilowany re.Pattern, zostawiamy jak jest
+            final_pattern = pattern
+    
+        # 2. Szukamy sekwencji używając Twojego uniwersalnego skanera (0x60 = Kod JIT i Statyczny)
+        addr = self.scan_memory_regex(final_pattern, protection=0x60)
+        
+        if addr:
+            # 3. Wyciągamy adres statyczny z kodu
+            address_in_code = addr + point
+            
+            # Wyciągamy 4 bajty i zamieniamy na liczbę (pointer)
+            raw_address = self.pm.read_bytes(address_in_code, 4)
+            actual_static_address = struct.unpack("<I", raw_address)[0]
+    
+            # 4. Zapisujemy hooka
+            self.hooks[name] = {"mailbox": actual_static_address, "offset": offset}
+            print(f" New Hook [S]: [{hex(self.get_adr(name,0))}] {name}")
+            return actual_static_address
+            
+        print(f"[X] Unable to get address for: {name}")    
+        return None
+    
+    def add_pure_field(self, name, pattern, offset=0x00, protection=0x60):
+        """
+        Znajduje wzorzec w pamięci i traktuje jego adres jako bazę (mailbox).
+        Idealne dla tablic, struktur danych i statycznych obiektów.
+        """
+    
+        # 1. Przygotowanie bezpiecznego regexu (obsługa bytes, str i wildcardów ??)
+        if isinstance(pattern, str):
+            p = pattern.replace(" ", "")
+            if "??" in p:
+                parts = [p[i:i+2] for i in range(0, len(p), 2)]
+                regex_parts = []
+                for part in parts:
+                    if part == "??":
+                        regex_parts.append(b'.')
+                    else:
+                        regex_parts.append(re.escape(bytes.fromhex(part)))
+                final_pattern = re.compile(b"".join(regex_parts), re.DOTALL)
+            else:
+                final_pattern = re.compile(re.escape(bytes.fromhex(p)), re.DOTALL)
+        elif isinstance(pattern, bytes):
+            final_pattern = re.compile(re.escape(pattern), re.DOTALL)
+        else:
+            final_pattern = pattern
+    
+        # 2. Skanowanie pamięci (używamy Twojego scan_memory_regex)
+        # Jeśli szukamy na stercie (0x04), używamy 0x04. 
+        # Jeśli w kodzie, używamy maski 0x60.
+        addr = self.scan_memory_regex(final_pattern, protection=protection)
+    
+        if addr:
+            # 3. W 'pure field' znaleziony adres JEST mailboxem
+            self.hooks[name] = {"mailbox": addr, "offset": offset}
+            
+            # Obliczamy finalny adres (Baza + Offset) dla czytelności loga
+            final_ptr = addr + offset
+            print(f" New Pure Field: [{hex(self.get_adr(name,0))}] {name}")
+            return addr
+    
+        print(f"[X] Pure Field not found: {name}")
+        return None
+    
+    def get_adr(self,key,inside=True):
+        if inside:
+            return self.pm.read_int(self.hooks[key]['mailbox'])+self.hooks[key]['offset']
+        return self.hooks[key]['mailbox']+self.hooks[key]['offset']
+        
+    def read_value(self, name, data_type="int"):
+        hook = self.hooks.get(name)
+        if not hook: return None
+        obj_addr = self.pm.read_int(hook['mailbox'])
+        if data_type == "int_stat": return obj_addr
+        if obj_addr == 0: return None
+        
+        final_addr = obj_addr + hook['offset']
+        
+        # Wybieramy sposób odczytu w zależności od typu
+        if data_type == "float":
+            import struct
+            raw = self.pm.read_bytes(final_addr, 4)
+            return struct.unpack('f', raw)[0]
+        elif data_type == "byte":
+            return self.pm.read_byte(final_addr) # Czyta 1 bajt (0-255)
+        else:
+            return self.pm.read_int(final_addr) # Czyta 4 bajty
+
+    def read_memory(self,mem_address,data_type="int"):
+        # Wybieramy sposób odczytu w zależności od typu
+        if data_type == "float":
+            raw = self.pm.read_bytes(mem_address, 4)
+            return struct.unpack('f', raw)[0]
+        elif data_type == "byte":
+            return self.pm.read_byte(mem_address) # Czyta 1 bajt (0-255)
+        else:
+            return self.pm.read_int(mem_address) # Czyta 4 bajty
+    
+    def input_move(self, key_name=["ESCAPE"], duration=1.0):
+        if "key_state_array" not in self.hooks.keys():
+            print("[x] Locate Keyboard data first!")
+            return
+        if "PASS" in key_name:
+            return
+    
+        # Weryfikacja poprawności wszystkich przekazanych klawiszy
+        for k in key_name:
+            if not self.key_map.get(k):
+                print(f"[x] Nieobsługiwany klawisz: {k} in {key_name}")
+                return
+        
+        try:
+            # 1. Pobieramy adres bazowy DANYCH sfałszowanej tablicy
+            # get_adr z inside=0 (False) zwróci nam (mailbox + offset)
+            # Czyli dla Twoich danych: 0x1910000 + 8 = 0x1910008
+            base_data_addr = self.get_adr("key_state_array", 0)
+            
+            # 2. Wciskanie klawiszy (press_key)
+            # Używamy enumerate(key_name), aby zapisywać ID klawiszy jedno za drugim
+            for index, button in enumerate(key_name):
+                vk_code = self.key_map.get(button)
+                
+                # A. Wpisujemy ID klawisza na listę do sprawdzenia przez grę
+                # Adres: Baza + 8 + 0, Baza + 8 + 1, itd.
+                self.pm.write_bytes(base_data_addr + index, struct.pack('B', vk_code), 1)
+                
+                # B. Ustawiamy stan tego klawisza jako "Wciśnięty" (0x80)
+                # Adres: Baza + 8 + VK_CODE
+                self.pm.write_bytes(base_data_addr + vk_code, b'\x80', 1)
+    
+            # 3. Trzymanie klawiszy
+            time.sleep(duration)
+            
+            # 4. Zwalnianie klawiszy (release_all)
+            # Czyścimy przestrzeń danych tablicy (256 bajtów stanów)
+            self.pm.write_bytes(base_data_addr, b'\x00' * 256, 256)
+            
+        except Exception as e:
+            print(f"[X] Błąd podczas input_move: {e}")
+        
+    def setup_absolute_bot_control(self,safe_test=0):
+        print("[*] Inicjalizacja Pełnego Przejęcia XNA/MonoGame...")    
+        
+        
+        # --- 1. TWORZENIE "SFAŁSZOWANEJ TABLICY C#" ---
+        # Alokujemy 264 bajty (8 bajtów nagłówka + 256 bajtów na stany klawiszy)
+        #bot_buffer_addr = self.pm.allocate(264)
+        bot_buffer_addr = pymem.memory.allocate_memory(
+        self.pm.process_handle,      # Uchwyt do procesu gry
+        264,                         # Dokładny rozmiar, o który prosiłeś
+        allocation_type=0x3000,      # MEM_COMMIT (0x1000) | MEM_RESERVE (0x2000)
+        protection_type=0x40         # PAGE_EXECUTE_READWRITE
+        )
+        
+        self.pm.write_bytes(bot_buffer_addr, b'\x00' * 264, 264)
+
+        # KLUCZOWE: Wpisujemy liczbę 256 pod offset +04. 
+        # To oszuka instrukcję 'cmp edx, [eax+04]', przekonując grę, że tablica jest pełna.
+        self.pm.write_int(bot_buffer_addr + 4, 256)
+        
+        print(f" [V] Sfałszowana Tablica zaalokowana pod: {hex(bot_buffer_addr)}")
+        if safe_test:
+            print("[V] SAFE QUIT+")
+            return bot_buffer_addr
+        # --- 2. WZORCE Z WILDCARDAMI ---
+        # Kropka '.' oznacza dokładnie 1 zmienny bajt. Cztery kropki '....' to 4 bajty (np. adres ASLR).
+    
+        # Wzorzec A (PlatformGetState, ładuje rejestr EBX)
+        # 8B 1D ?? ?? ?? ?? (mov ebx, [ADR]) -> 6 bajtów
+        # 33 F6 (xor esi,esi) -> 2 bajty
+        # 8B 43 04 (mov eax,[ebx+4]) -> 3 bajty
+        # 89 45 ?? (mov [ebp-X],eax) -> 3 bajty
+        # 85 C0 (test eax,eax) -> 2 bajty
+        pattern_ebx = b'\x8B\x1D....\x33\xF6\x8B\x43\x04\x89\x45.\x85\xC0'
+    
+        # Wzorzec B (PlatformGetState, ładuje rejestr EAX)
+        # A1 ?? ?? ?? ?? (mov eax, [ADR]) -> 5 bajtów
+        # 3B 50 04 (cmp edx,[eax+4]) -> 3 bajty
+        # 0F 83 ?? ?? ?? ?? (jae +X) -> 6 bajtów
+        # F6 44 ?? 08 80 (test byte ptr [eax+reg+8], 80) -> 5 bajtów
+        pattern_eax = b'\xA1....\x3B\x50\x04\x0F\x83....\xF6\x44.\x08\x80'
+    
+        # Wzorzec C (Wewnątrz Lambda <.cctor>b__0)
+        # A1 ?? ?? ?? ?? (mov eax, [ADR]) -> 5 bajtów
+        # 3B 48 04 (cmp ecx,[eax+4]) -> 3 bajty
+        # 73 ?? (jae +X) -> 2 bajty
+        # F6 44 ?? 08 80 (test byte ptr [eax+reg+8], 80) -> 5 bajtów
+        pattern_lambda = b'\xA1....\x3B\x48\x04\x73.\xF6\x44.\x08\x80'
+    
+        # --- 3. SKANOWANIE I PODMIANA (HIJACKING) ---
+        current_addr = 0
+        max_addr = 0x7FFFFFFF
+        
+        found_ebx = False
+        found_eax = False
+        found_lambda = False
+    
+        try:
+            while current_addr < max_addr:
+                mbi = pymem.memory.virtual_query(self.pm.process_handle, current_addr)
+                if mbi.State == 0x1000 and (mbi.Protect & 0x20 or mbi.Protect & 0x40):
+                    page_data = self.pm.read_bytes(mbi.BaseAddress, mbi.RegionSize)
+                    
+                    # Przejęcie EBX (PlatformGetState)
+                    if not found_ebx:
+                        match = re.search(pattern_ebx, page_data, re.DOTALL)
+                        if match:
+                            addr = mbi.BaseAddress + match.start()
+                            # Zastępujemy 'mov ebx, [Zmienny_Adres]' (6 bajtów) 
+                            # na 'mov ebx, NASZ_ADRES' (\xBB + 4 bajty) + NOP (\x90) (6 bajtów)
+                            new_inst = b'\xBB' + struct.pack('<I', bot_buffer_addr) + b'\x90'
+                            self.pm.write_bytes(addr, new_inst, 6)
+                            #print(f" [V] Wskaźnik EBX przejęty pod: {hex(addr)}")
+                            found_ebx = True
+    
+                    # Przejęcie EAX (PlatformGetState)
+                    if not found_eax:
+                        match = re.search(pattern_eax, page_data, re.DOTALL)
+                        if match:
+                            addr = mbi.BaseAddress + match.start()
+                            # Zastępujemy 'mov eax, [Zmienny_Adres]' (5 bajtów)
+                            # na 'mov eax, NASZ_ADRES' (\xB8 + 4 bajty) (5 bajtów - idealnie pasuje)
+                            new_inst = b'\xB8' + struct.pack('<I', bot_buffer_addr)
+                            self.pm.write_bytes(addr, new_inst, 5)
+                            #print(f" [V] Wskaźnik EAX (Main) przejęty pod: {hex(addr)}")
+                            found_eax = True
+    
+                    # Przejęcie EAX (Lambda Cctor)
+                    if not found_lambda:
+                        match = re.search(pattern_lambda, page_data, re.DOTALL)
+                        if match:
+                            addr = mbi.BaseAddress + match.start()
+                            # Analogicznie jak wyżej, \xB8 to kod instrukcji MOV EAX, stała_32bit
+                            new_inst = b'\xB8' + struct.pack('<I', bot_buffer_addr)
+                            self.pm.write_bytes(addr, new_inst, 5)
+                            #print(f" [V] Wskaźnik EAX (Lambda) przejęty pod: {hex(addr)}")
+                            found_lambda = True
+    
+                    if found_ebx and found_eax and found_lambda:
+                        print("\n[V] Pełna kontrola")
+                        break
+    
+                current_addr = mbi.BaseAddress + mbi.RegionSize
+                
+        except Exception as e:
+            print(f" [X] Błąd wstrzykiwania: {e}")
+    
+        self.hooks["key_state_array"]["mailbox"] = bot_buffer_addr
+        return bot_buffer_addr                   
+
+    def unpin_window(self):
+        """
+        Blokuje procedurę OnDeactivate, wstawiając 'ret 0004' na początku funkcji.
+        Dzięki temu gra nigdy nie dowie się, że straciła fokus.
+        """
+        # Sygnatura: 55 8B EC 56 8B F1 80 7E ?? 00 74 21
+        # Kropka (.) w regexie zastępuje dowolny bajt (Twoje ??)
+        pattern = b'\x55\x8B\xEC\x56\x8B\xF1\x80\x7E.\x00\x74\x21'
+        
+        # Bajty patcha: ret 0004 (C2 04 00)
+        patch = b'\xC2\x04\x00'
+        
+        current_address = 0
+        max_address = 0x7FFFFFFF # Zakres 32-bitowy
+        
+        print(" [*] Szukanie OnDeactivate (AOB Scan)...")
+        
+        try:
+            while current_address < max_address:
+                try:
+                    mbi = pymem.memory.virtual_query(self.pm.process_handle, current_address)
+                    
+                    # Skanujemy tylko pamięć zatwierdzoną (COMMIT) i wykonywalną (EXECUTE)
+                    # To tam JIT umieszcza skompilowany kod metod MonoGame
+                    if mbi.State == 0x1000 and (mbi.Protect & 0x20 or mbi.Protect & 0x40):
+                        page_data = self.pm.read_bytes(mbi.BaseAddress, mbi.RegionSize)
+                        
+                        match = re.search(pattern, page_data, re.DOTALL)
+                        if match:
+                            found_addr = mbi.BaseAddress + match.start()
+                            
+                            # Aplikujemy patch: nadpisujemy pierwsze 3 bajty (push ebp; mov ebp,esp)
+                            self.pm.write_bytes(found_addr, patch, len(patch))
+                            
+                            print(f" [V] Okno odpięte (OnDeactivate spatchowane) pod: {hex(found_addr)}")
+                            return True
+                    
+                    current_address = mbi.BaseAddress + mbi.RegionSize
+                except:
+                    current_address += 4096 # Skok o stronę w razie braku dostępu
+                    
+            print(" [X] Nie znaleziono sygnatury OnDeactivate.")
+            return False
+            
+        except Exception as e:
+            print(f" [X] Błąd podczas unpin_window: {e}")
+            return False
+
+    def fix_fps_drop(self):
+        """
+        Eliminuje spadek FPS w tle poprzez wymuszenie skoku nad Thread.Sleep w metodzie Tick.
+        Zmienia 'jne' (75) na 'jmp' (EB) w logice sprawdzania IsActive.
+        """
+        # Sygnatura oparta na Twoim logu:
+        # 80 78 1B 00 75 4D 8D 7D E0 8D 73 5C F3 0F 7E 06
+        # 80 78 . 00  -> cmp byte ptr [eax+1B], 00
+        # 75 .        -> jne (nasz cel)
+        # 8D 7D .     -> lea edi, [ebp-20]
+        # 8D 73 .     -> lea esi, [ebx+5C]
+        # F3 0F 7E 06 -> movq xmm0, [esi]
+        
+        pattern = b'\x80\x78.\x00\x75.\x8D\x7D.\x8D\x73.\xF3\x0F\x7E\x06'
+        
+        current_address = 0
+        max_address = 0x7FFFFFFF
+        
+        print(" [*] Szukanie blokady FPS w Game::Tick...")
+        
+        try:
+            while current_address < max_address:
+                try:
+                    mbi = pymem.memory.virtual_query(self.pm.process_handle, current_address)
+                    
+                    if mbi.State == 0x1000 and (mbi.Protect & 0x20 or mbi.Protect & 0x40):
+                        page_data = self.pm.read_bytes(mbi.BaseAddress, mbi.RegionSize)
+                        
+                        match = re.search(pattern, page_data, re.DOTALL)
+                        if match:
+                            # Znaleźliśmy początek wzorca (instrukcję CMP)
+                            # Instrukcja JNE (75 XX) zaczyna się 4 bajty dalej
+                            found_addr = mbi.BaseAddress + match.start()
+                            jne_address = found_addr + 4
+                            
+                            # Czytamy oryginalny dystans skoku (bajt po 0x75)
+                            original_offset = page_data[match.start() + 5]
+                            
+                            # Tworzymy patch: zamieniamy 75 (JNE) na EB (JMP)
+                            # Zachowujemy ten sam dystans skoku (original_offset)
+                            patch = bytes([0xEB, original_offset])
+                            
+                            self.pm.write_bytes(jne_address, patch, len(patch))
+                            
+                            print(f" [V] FPS Fix zaaplikowany pod: {hex(jne_address)} (JNE -> JMP)")
+                            return True
+                    
+                    current_address = mbi.BaseAddress + mbi.RegionSize
+                except:
+                    current_address += 4096
+                    
+            print(" [X] Nie znaleziono sygnatury Tick::Sleep.")
+            return False
+            
+        except Exception as e:
+            print(f" [X] Błąd podczas fix_fps_drop: {e}")
+            return False
+    
+    #BASE 0x04 JIT [KODOWA] protection musi być 0x20 lub 0x40!
+    def scan_memory_regex(self, pattern, protection=0x04):
+        import re
+        import pymem.memory
+        
+        # 1. Obsługa kompilacji i flag
+        if isinstance(pattern, bytes):
+            # Jeśli to surowe bajty, kompilujemy z flagami
+            regex = re.compile(pattern, re.DOTALL)
+        elif isinstance(pattern, re.Pattern):
+            # Jeśli już skompilowany, po prostu go używamy
+            regex = pattern
+        else:
+            # Dla stringów (opcjonalnie)
+            regex = re.compile(pattern, re.DOTALL)
+    
+        current_address = 0
+        max_address = 0x7FFFFFFF 
+        
+        try:
+            while current_address < max_address:
+                try:
+                    mbi = pymem.memory.virtual_query(self.pm.process_handle, current_address)
+                    if mbi.State == 0x1000 and (mbi.Protect & protection):
+                        page_data = self.pm.read_bytes(mbi.BaseAddress, mbi.RegionSize)
+                        
+                        # 2. KLUCZOWA ZMIANA:
+                        # Używamy metody .search() obiektu regex, 
+                        # zamiast globalnego re.search(regex, data, flags)
+                        match = regex.search(page_data)
+                        if match:
+                            return mbi.BaseAddress + match.start()    
+                    current_address = mbi.BaseAddress + mbi.RegionSize
+                except:
+                    current_address += 4096
+            return None
+        except Exception as e:
+            print(f" [X] Błąd skanera: {e}")
+            return None
